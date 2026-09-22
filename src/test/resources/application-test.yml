@@ -1,0 +1,17 @@
+spring:
+  jpa:
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+
+booking:
+  lock:
+    enabled: true
+    wait-seconds: 20
+    lease-seconds: 10
+  confirmation:
+    min-delay-ms: 5
+    max-delay-ms: 20
+    simulated-failure-rate: 0.0
+    max-retries: 3

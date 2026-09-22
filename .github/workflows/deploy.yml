@@ -1,0 +1,43 @@
+name: Deploy to AWS ECS
+
+# Only runs when explicitly enabled via the AWS_DEPLOY_ENABLED repository variable, so this
+# workflow stays green (by cleanly skipping) in a fork or demo clone that has no AWS account
+# configured. See infra/terraform for the ECS cluster/service this deploys to.
+on:
+  workflow_run:
+    workflows: ["Docker Publish"]
+    types: [completed]
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    if: vars.AWS_DEPLOY_ENABLED == 'true' && (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Force new ECS deployment
+        run: |
+          aws ecs update-service \
+            --cluster "${{ vars.ECS_CLUSTER_NAME }}" \
+            --service "${{ vars.ECS_SERVICE_NAME }}" \
+            --force-new-deployment
+
+      - name: Wait for service to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${{ vars.ECS_CLUSTER_NAME }}" \
+            --services "${{ vars.ECS_SERVICE_NAME }}"
+
+# Required repository configuration for this workflow to actually run:
+#   Variables: AWS_DEPLOY_ENABLED=true, AWS_REGION, ECS_CLUSTER_NAME, ECS_SERVICE_NAME
+#   Secrets:   AWS_ROLE_ARN (an IAM role trusting GitHub's OIDC provider, scoped to ecs:UpdateService)
