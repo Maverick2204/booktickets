@@ -28,7 +28,7 @@ public class BookingConfirmationService {
      */
     @Transactional
     public boolean confirm(Long bookingId) {
-        Booking booking = bookingRepository.findById(bookingId).orElse(null);
+        Booking booking = bookingRepository.findByIdForUpdate(bookingId).orElse(null);
         if (booking == null || booking.getStatus() != BookingStatus.PENDING) {
             log.info("Skipping confirm for bookingId={}, not in PENDING state (possible redelivery)", bookingId);
             return false;
@@ -44,7 +44,7 @@ public class BookingConfirmationService {
      */
     @Transactional
     public boolean failAndCompensate(Long bookingId, String reason) {
-        Booking booking = bookingRepository.findById(bookingId).orElse(null);
+        Booking booking = bookingRepository.findByIdForUpdate(bookingId).orElse(null);
         if (booking == null || booking.getStatus() != BookingStatus.PENDING) {
             log.info("Skipping fail-compensate for bookingId={}, not in PENDING state", bookingId);
             return false;

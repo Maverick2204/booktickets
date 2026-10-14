@@ -60,6 +60,10 @@ booking:
     max-delay-ms: 500
     simulated-failure-rate: 0.05
     max-retries: 3
+  expiry:
+    # Seats held by a booking still PENDING after this long are released back.
+    pending-ttl: 15m
+    sweep-interval-ms: 60000
 
 logging:
   level:

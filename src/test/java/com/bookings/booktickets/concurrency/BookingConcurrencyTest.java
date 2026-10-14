@@ -26,7 +26,7 @@ import org.junit.jupiter.api.Timeout;
 import org.springframework.beans.factory.annotation.Autowired;
 
 /**
- * Proves the resume claim: under 200 truly concurrent booking attempts against 50 seats, the
+ * Proves the core guarantee: under 200 truly concurrent booking attempts against 50 seats, the
  * platform never oversells - exactly 50 bookings succeed, the rest are correctly rejected, and
  * the database ends up in a consistent state. Runs with the real Redis lock (via
  * {@code booking.lock.enabled=true}, the default). See {@link BookingConcurrencyWithoutRedisLockTest}

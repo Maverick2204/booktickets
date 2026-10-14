@@ -1,12 +1,8 @@
 # BookTickets
 
-A concurrency-safe event ticket booking platform, built to demonstrate (and honestly measure)
-this claim:
-
-> Build a booking platform preventing overselling under concurrent load using PostgreSQL
-> transactions and Redis-based distributed locks; processed async confirmations via
-> RabbitMQ; deployed on AWS with Docker and CI/CD, sustaining ~1,198 req/s at 459ms p95
-> under load testing.
+A ticket booking backend that never oversells under concurrent load. Seats are reserved in a
+single PostgreSQL transaction, concurrent requests for the same event are coordinated with a
+Redis lock, and payment confirmation happens asynchronously over RabbitMQ.
 
 Java 21 / Spring Boot 3, PostgreSQL, Redis (Redisson), RabbitMQ, Docker, Terraform, GitHub
 Actions, k6.
@@ -35,15 +31,21 @@ Actions, k6.
                 success -> booking CONFIRMED
                 decline -> booking FAILED + inventory released back
                 infra error -> retried, then dead-lettered (booking.confirmation.dlq)
+
+  PendingBookingExpiryJob (every 60s): any booking still PENDING after 15 min
+                -> FAILED + inventory released back
 ```
 
 ### Why both a Redis lock *and* a Postgres transaction? (defense in depth)
 
-- **The Redis distributed lock** (`BookingService`, via Redisson, one `RLock` per event) is a
-  **throughput/coordination optimization**. It serializes concurrent booking attempts for the
-  same event - useful once there's more than one app instance (see the ECS service running
-  `desired_count = 2` in `infra/terraform`) - and reduces DB contention and wasted retries
-  under load. It is deliberately **not** what guarantees correctness.
+- **The Redis distributed lock** (`BookingService`, via Redisson, one `RLock` per event)
+  serializes booking attempts for the same event across app instances, so requests queue in
+  Redis instead of piling up as blocked connections on one hot Postgres row. It is
+  deliberately **not** what guarantees correctness. The trade-off: it adds a Redis round trip
+  per booking, and a request that can't get the lock within `wait-seconds` gets a 503. Since
+  Postgres already serializes updates to that row, whether the lock pays for itself depends on
+  the load; run the k6 test with `booking.lock.enabled` set to true and then to false to
+  compare.
 - **The Postgres transaction** (`BookingReservationWorker`) is what actually prevents
   overselling: a single atomic conditional update,
   `UPDATE events SET available_seats = available_seats - :n WHERE id = :id AND available_seats >= :n`,
@@ -117,9 +119,10 @@ Runs unit tests (Surefire) and Testcontainers-backed integration tests (Failsafe
   booking is confirmed.
 - **`BookingConfirmationListenerIT`** - forces a business decline (asserts inventory is
   released back) and an infra failure (asserts the message is dead-lettered after retries).
+- **`PendingBookingExpiryJobIT`** - a booking whose confirmation message never arrives is
+  expired and its seats are released exactly once, even if the sweep runs twice.
 
-All of the above were run against this exact stack; see `target/surefire-reports` and
-`target/failsafe-reports` after running.
+Reports land in `target/surefire-reports` and `target/failsafe-reports`.
 
 ## Load test
 
@@ -135,23 +138,25 @@ k6 run loadtest/k6/booking-load-test.js -e BASE_URL=http://localhost:8080 -e EVE
 docker-compose exec -T postgres psql -U booktickets -d booktickets -v event_id=$EVENT_ID < loadtest/verify-no-oversell.sql
 ```
 
-### Real results (measured on this machine, single app instance, default pool sizes)
+### Results (local run: single app instance on a laptop, default pool sizes)
 
 Ramping to 200 virtual users against a 500-seat event, deliberately requesting far more seats
 in aggregate than available so the rejection path is genuinely exercised:
 
 | Metric | Value |
 |---|---|
-| Total requests | 59,889 over 50s |
+| Total requests | 59,889 over 50s (~500 bookings, the rest rejected as sold out) |
 | **Throughput** | **~1,198 req/s** |
 | **p95 latency** | **~459ms** |
 | Median latency | ~67ms |
 | Correctly handled (201/409/503) | 100% (59,889 / 59,889) |
 | Overselling detected | **None** - `reserved_count` matched `total_seats - available_seats` exactly, both mid-run and after the async confirmation backlog drained |
 
-These numbers are from a single container on a dev laptop with an untuned Hikari pool
-(`maximum-pool-size: 20`) and default Tomcat thread settings - they're a honest floor, not a
-tuned production ceiling. A real deployment (multiple ECS tasks behind the ALB, tuned
+Because the event sells out within the first second or so, almost all of these requests take
+the rejection path (lock, conditional `UPDATE` that matches 0 rows, 409). So read the
+throughput figure as "handles a flash-sale rush without overselling", not as successful
+bookings per second. The app ran in a single container with an untuned Hikari pool
+(`maximum-pool-size: 20`) and default Tomcat thread settings. A real deployment (multiple ECS tasks behind the ALB, tuned
 connection pools, a properly sized RDS instance) would be expected to do meaningfully better;
 re-run the same script against that environment to get real numbers for it rather than
 assuming these carry over.
@@ -159,7 +164,7 @@ assuming these carry over.
 ## Docker
 
 Multi-stage `Dockerfile` (Maven build stage -> `eclipse-temurin:21-jre-alpine` runtime,
-non-root user, `/actuator/health` healthcheck). Verified end-to-end on this machine: image
+non-root user, `/actuator/health` healthcheck). Tested end-to-end locally: the image
 builds, all four services start, the full booking -> async confirmation -> oversell-rejection
 flow works through real HTTP calls against the containerized stack.
 
@@ -183,12 +188,10 @@ and an ECS Fargate service running **`desired_count = 2`** - deliberately more t
 instance, since that's what makes the Redis distributed lock claim meaningful (a single
 instance would never need cross-process coordination).
 
-**This was validated with `terraform fmt` and `terraform validate` (both pass) and a
-`terraform plan` that correctly proceeds through every provider-agnostic resource before
-failing at the expected point - missing AWS credentials. It has not been `terraform apply`'d
-in this session** - there's no AWS account configured here. Point it at a real account (`cd
-infra/terraform && terraform init && terraform apply -var-file=envs/dev/dev.tfvars`) to stand
-it up for real.
+`terraform fmt` and `terraform validate` pass. To stand it up in your own account:
+`cd infra/terraform && terraform init && terraform apply -var-file=envs/dev/dev.tfvars`, then
+enable the deploy workflow (see CI/CD above). Remember to `terraform destroy` afterwards; RDS,
+ElastiCache, Amazon MQ and the NAT/ALB all bill hourly.
 
 **Caveat:** the ElastiCache node here is a single instance. A true multi-master Redlock setup
 (the algorithm's actual durability guarantee) needs several independent Redis nodes, which is
@@ -203,9 +206,17 @@ Postgres layer is what actually carries the correctness guarantee regardless.
   the more commonly cited textbook approach; the conditional UPDATE is strictly simpler here
   and provides the same guarantee.
 - **Single seat counter per event**, not per-seat rows: this is general-admission-style
-  ticketing (quantity per booking), matching the resume claim without an unneeded seat map.
+  ticketing (quantity per booking), so there is no seat map.
 - **No authentication**: `userId` is a caller-supplied string, explicitly a demo
   simplification, not a security boundary.
 - **Manual RabbitMQ ack/nack with a manual retry-count header**, capped at 3 attempts before
   dead-lettering, rather than Spring Retry - keeps the retry/DLQ topology fully visible in
   `RabbitMqConfig` rather than hidden in annotation config.
+- **Stuck bookings expire instead of holding seats forever.** The message is published only
+  after the transaction commits, so a crash between commit and publish (or a dead-lettered
+  message) would otherwise leave a booking PENDING with its seats held. `PendingBookingExpiryJob`
+  fails and compensates anything PENDING longer than `booking.expiry.pending-ttl`. It runs on
+  every instance; `failAndCompensate` takes a row lock (`SELECT ... FOR UPDATE`) and no-ops on
+  anything no longer PENDING, so seats can't be released twice. A transactional outbox would
+  close the gap without the delay; the expiry job is the simpler fix that also covers abandoned
+  payments.
